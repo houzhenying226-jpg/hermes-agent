@@ -81,6 +81,142 @@ def test_fesun_tick_dispatches_on_first_no_progress_tick_by_default(tmp_path, mo
     assert "当前目标：⑥销售B2B / spec" in text
 
 
+def test_fesun_tick_blocks_dispatch_when_kgctl_does_not_authorize(tmp_path, monkeypatch):
+    hermes_fesun_watchdog, kanban_db = _modules(tmp_path, monkeypatch)
+    repo, runbook = _repo(tmp_path)
+    monkeypatch.setattr(
+        hermes_fesun_watchdog,
+        "_kgctl_control_status",
+        lambda _repo: {
+            "status": "blocked",
+            "enforced": True,
+            "dispatch_authorized": False,
+            "control_blockers": [
+                "flat queue requires KGCTL_MACHINE_TASK dispatch_authorized: true"
+            ],
+            "current_task": "FSN-553",
+            "queue_remaining": 1,
+        },
+    )
+    monkeypatch.setattr(
+        hermes_fesun_watchdog,
+        "_dispatch_once",
+        lambda _board: (_ for _ in ()).throw(AssertionError("dispatcher must not run")),
+    )
+
+    result = hermes_fesun_watchdog.tick(
+        hermes_fesun_watchdog.FesunTickOptions(
+            repo=str(repo),
+            runbook=str(runbook),
+            create_tasks=True,
+            dispatch=True,
+            board="default",
+        )
+    )
+
+    heartbeat = result["heartbeat"]
+    assert heartbeat["mode"] == "control_blocked"
+    assert heartbeat["runnable_count"] == 0
+    assert heartbeat["created_tasks"] == []
+    assert heartbeat["dispatch"] is None
+    assert heartbeat["no_progress_count"] == 0
+    assert heartbeat["guards"]["control"]["current_task"] == "FSN-553"
+    with kanban_db.connect(board="default") as conn:
+        task_count = conn.execute("SELECT COUNT(*) AS count FROM tasks").fetchone()["count"]
+    assert task_count == 0
+
+
+def test_fesun_tick_fails_closed_when_kgctl_is_unavailable(tmp_path, monkeypatch):
+    hermes_fesun_watchdog, _ = _modules(tmp_path, monkeypatch)
+    repo, runbook = _repo(tmp_path)
+    monkeypatch.setattr(
+        hermes_fesun_watchdog,
+        "_kgctl_control_status",
+        lambda _repo: {
+            "status": "unavailable",
+            "enforced": True,
+            "dispatch_authorized": False,
+            "control_blockers": ["kgctl status FESUN unavailable: timeout"],
+        },
+    )
+
+    result = hermes_fesun_watchdog.tick(
+        hermes_fesun_watchdog.FesunTickOptions(
+            repo=str(repo),
+            runbook=str(runbook),
+            create_tasks=True,
+            dispatch=True,
+            board="default",
+        )
+    )
+
+    heartbeat = result["heartbeat"]
+    assert heartbeat["mode"] == "control_unavailable"
+    assert heartbeat["runnable_count"] == 0
+    assert heartbeat["created_tasks"] == []
+    assert heartbeat["dispatch"] is None
+
+
+def test_fesun_spec_watchdog_does_not_requeue_module_after_pr_merge(tmp_path, monkeypatch):
+    hermes_fesun_watchdog, _ = _modules(tmp_path, monkeypatch)
+    module = {
+        "模块": "③财务",
+        "当前步": "code_preflight 2/3 PASS；PR1 已合并；PR2 仅在独立授权后可开始",
+        "故事": "✅Story",
+        "spec": "✅Spec Review Final PASS",
+        "contract": "✅Contract Gate Final PASS",
+        "Linear": "✅FSN-551",
+        "开发": "PR1 已合并；PR2 未开始；未部署",
+        "真待决": "H-FIN-01/02 pending_by_decision",
+    }
+
+    assert hermes_fesun_watchdog._is_supervised_code_pr_ready(module) is True
+    assert hermes_fesun_watchdog._eligible_modules([module]) == []
+
+
+def test_fesun_control_gate_blocks_false_green_when_current_task_has_no_target(
+    tmp_path, monkeypatch
+):
+    hermes_fesun_watchdog, _ = _modules(tmp_path, monkeypatch)
+    guarded = hermes_fesun_watchdog._apply_control_target_guard(
+        {
+            "status": "authorized",
+            "enforced": True,
+            "dispatch_authorized": True,
+            "control_blockers": [],
+            "current_task": "FSN-551",
+            "queue_remaining": 1,
+        },
+        None,
+    )
+
+    assert guarded["status"] == "target_mismatch"
+    assert guarded["dispatch_authorized"] is False
+    assert guarded["control_blockers"] == [
+        "kgctl current task FSN-551 has no matching watchdog target"
+    ]
+
+
+def test_fesun_control_gate_fails_closed_when_authorized_task_is_missing(
+    tmp_path, monkeypatch
+):
+    hermes_fesun_watchdog, _ = _modules(tmp_path, monkeypatch)
+    guarded = hermes_fesun_watchdog._apply_control_target_guard(
+        {
+            "status": "authorized",
+            "enforced": True,
+            "dispatch_authorized": True,
+            "control_blockers": [],
+            "current_task": None,
+            "queue_remaining": 1,
+        },
+        {"module": "③财务", "stage": "code_preflight", "row": {"Linear": "FSN-551"}},
+    )
+
+    assert guarded["status"] == "target_mismatch"
+    assert guarded["dispatch_authorized"] is False
+
+
 def test_gateway_status_write_skips_desktop_mirror(tmp_path, monkeypatch):
     hermes_fesun_watchdog, _ = _modules(tmp_path, monkeypatch)
     desktop_status = tmp_path / "Desktop" / "status.md"

@@ -28,6 +28,7 @@ FESUN_JOB_NAME = "Fesun Nine Module SPEC Watchdog"
 FESUN_SCRIPT_NAME = "fesun_nine_spec_watchdog.py"
 FESUN_VISIBLE_STATUS_NAME = "Hermes-Fesun-实时状态.md"
 DEFAULT_REPO = "/Users/james/fesun-platform"
+KGCTL_BIN = "/Users/james/bin/kgctl"
 DEFAULT_ASSIGNEE = "default"
 DEFAULT_RUNBOOK = (
     "/Users/james/fesun-platform/docs/plans/"
@@ -149,6 +150,131 @@ class FesunTickOptions:
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _kgctl_control_status(repo: Path) -> dict[str, Any]:
+    """Read the FESUN dispatch gate from the authoritative control plane."""
+    if repo != Path(DEFAULT_REPO).expanduser().resolve():
+        return {
+            "status": "not_applicable",
+            "enforced": False,
+            "dispatch_authorized": True,
+            "control_blockers": [],
+        }
+
+    command = [KGCTL_BIN, "status", "FESUN"]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "status": "unavailable",
+            "enforced": True,
+            "dispatch_authorized": False,
+            "control_blockers": [f"kgctl status FESUN unavailable: {exc}"],
+            "command": command,
+        }
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        return {
+            "status": "unavailable",
+            "enforced": True,
+            "dispatch_authorized": False,
+            "control_blockers": [f"kgctl status FESUN failed ({result.returncode}): {detail}"],
+            "command": command,
+        }
+
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        return {
+            "status": "unavailable",
+            "enforced": True,
+            "dispatch_authorized": False,
+            "control_blockers": [f"kgctl status FESUN returned invalid JSON: {exc}"],
+            "command": command,
+        }
+    if not isinstance(payload, dict):
+        return {
+            "status": "unavailable",
+            "enforced": True,
+            "dispatch_authorized": False,
+            "control_blockers": ["kgctl status FESUN returned a non-object JSON payload"],
+            "command": command,
+        }
+
+    authorized = payload.get("dispatch_authorized") is True
+    blockers = [str(item) for item in payload.get("control_blockers") or []]
+    if not authorized and not blockers:
+        blockers = ["kgctl status FESUN did not authorize dispatch"]
+    return {
+        "status": "authorized" if authorized else "blocked",
+        "enforced": True,
+        "dispatch_authorized": authorized,
+        "control_blockers": blockers,
+        "current_task": payload.get("current_task"),
+        "current_queue_item": payload.get("current_queue_item"),
+        "queue_model": payload.get("queue_model"),
+        "queue_remaining": payload.get("queue_remaining"),
+        "origin_main": payload.get("origin_main"),
+        "next_legal_action": payload.get("next_legal_action"),
+        "command": command,
+    }
+
+
+def _apply_control_target_guard(control: dict[str, Any], target: dict[str, Any] | None) -> dict[str, Any]:
+    if not control.get("enforced") or not control.get("dispatch_authorized"):
+        return control
+
+    current_task = str(control.get("current_task") or "").strip()
+    try:
+        queue_remaining = int(control.get("queue_remaining") or 0)
+    except (TypeError, ValueError):
+        queue_remaining = 1
+    if queue_remaining > 0 and not current_task:
+        guarded = dict(control)
+        guarded["status"] = "target_mismatch"
+        guarded["dispatch_authorized"] = False
+        guarded["control_blockers"] = [
+            "kgctl authorized dispatch with a non-empty queue but no current task"
+        ]
+        return guarded
+    if not target and current_task and queue_remaining > 0:
+        guarded = dict(control)
+        guarded["status"] = "target_mismatch"
+        guarded["dispatch_authorized"] = False
+        guarded["control_blockers"] = [
+            f"kgctl current task {current_task} has no matching watchdog target"
+        ]
+        return guarded
+
+    if not target or not current_task:
+        return control
+
+    current_ids = set(re.findall(r"FSN-\d+", current_task, flags=re.IGNORECASE))
+    target_ids = set(
+        re.findall(
+            r"FSN-\d+",
+            json.dumps(target, ensure_ascii=False),
+            flags=re.IGNORECASE,
+        )
+    )
+    if current_ids and current_ids.isdisjoint(target_ids):
+        guarded = dict(control)
+        guarded["status"] = "target_mismatch"
+        guarded["dispatch_authorized"] = False
+        guarded["control_blockers"] = [
+            f"kgctl current task {current_task} does not match watchdog target IDs {sorted(target_ids)}"
+        ]
+        return guarded
+    return control
 
 
 def _home() -> Path:
@@ -836,10 +962,15 @@ def _is_supervised_code_pr_ready(module: dict[str, str]) -> bool:
     already-satisfied next_action target until the attempt limit freezes it.
     """
 
+    row_text = _compact(" ".join(str(module.get(key, "") or "") for key in module))
+    # Once an implementation PR has merged, this module has already left the
+    # SPEC-only queue. Never send it back to an earlier document-review stage.
+    if re.search(r"PR\d+已合并", row_text, flags=re.IGNORECASE):
+        return True
+
     next_action = _compact(_extract_next_action(module))
     if not any(marker in next_action for marker in SUPERVISED_CODE_PR_ACTION_MARKERS):
         return False
-    row_text = _compact(" ".join(str(module.get(key, "") or "") for key in module))
     has_gate_evidence = any(marker in row_text for marker in SUPERVISED_CODE_PR_GATE_MARKERS)
     has_handoff_evidence = any(marker in row_text for marker in SUPERVISED_CODE_PR_HANDOFF_MARKERS)
     return has_gate_evidence and has_handoff_evidence
@@ -1894,6 +2025,8 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
     blocked_reviews = _blocked_review_tasks(opts.board, repo)
     eligible = _eligible_modules(runbook_data["modules"])
     target, parked_external_blockers, external_blocker = _select_dispatch_target(eligible)
+    control = _apply_control_target_guard(_kgctl_control_status(repo), target)
+    control_allows_dispatch = control.get("dispatch_authorized") is True
     diff_guard = _diff_guard(repo, state.get("baseline_out_of_scope", []))
     symlink_guard = _symlink_guard(repo)
     diagnosis = _blocked_diagnosis(diff_guard, symlink_guard)
@@ -1905,7 +2038,7 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
         active=active,
         diff_guard=diff_guard,
         closure_stall_seconds=int(opts.closure_stall_seconds),
-        enabled=bool(opts.create_tasks),
+        enabled=bool(opts.create_tasks) and control_allows_dispatch,
     )
     if closure_recoveries:
         runbook_data = parse_runbook(runbook)
@@ -1915,6 +2048,8 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
         blocked_reviews = _blocked_review_tasks(opts.board, repo)
         eligible = _eligible_modules(runbook_data["modules"])
         target, parked_external_blockers, external_blocker = _select_dispatch_target(eligible)
+        control = _apply_control_target_guard(_kgctl_control_status(repo), target)
+        control_allows_dispatch = control.get("dispatch_authorized") is True
         diff_guard = _diff_guard(repo, state.get("baseline_out_of_scope", []))
         symlink_guard = _symlink_guard(repo)
         diagnosis = _blocked_diagnosis(diff_guard, symlink_guard)
@@ -1924,7 +2059,7 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
         target=target,
         active=active,
         diff_guard=diff_guard,
-        enabled=bool(opts.create_tasks),
+        enabled=bool(opts.create_tasks) and control_allows_dispatch,
     )
     if orphan_recoveries:
         closure_recoveries.extend(orphan_recoveries)
@@ -1935,6 +2070,8 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
         blocked_reviews = _blocked_review_tasks(opts.board, repo)
         eligible = _eligible_modules(runbook_data["modules"])
         target, parked_external_blockers, external_blocker = _select_dispatch_target(eligible)
+        control = _apply_control_target_guard(_kgctl_control_status(repo), target)
+        control_allows_dispatch = control.get("dispatch_authorized") is True
         diff_guard = _diff_guard(repo, state.get("baseline_out_of_scope", []))
         symlink_guard = _symlink_guard(repo)
         diagnosis = _blocked_diagnosis(diff_guard, symlink_guard)
@@ -1944,7 +2081,7 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
     progressed = fingerprint != previous and bool(previous)
     if progressed:
         no_progress_count = 0
-    elif target and not active and external_blocker.get("status") != "blocked":
+    elif control_allows_dispatch and target and not active and external_blocker.get("status") != "blocked":
         no_progress_count = int(state.get("no_progress_count", 0)) + 1
     else:
         no_progress_count = 0
@@ -1962,6 +2099,9 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
     elif not symlink_guard["passed"]:
         mode = "guard_blocked"
         blocked_reason = str(diagnosis.get("summary") or "bad symlink under allowed docs roots")
+    elif not control_allows_dispatch:
+        mode = "control_unavailable" if control.get("status") == "unavailable" else "control_blocked"
+        blocked_reason = "; ".join(control.get("control_blockers") or ["kgctl dispatch gate blocked"])
     elif blocked_reviews and opts.create_tasks:
         original = blocked_reviews[0]
         task_id, created, info = _create_review_recovery_task(
@@ -2037,7 +2177,7 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
     # the overnight no-idle path: stale "running" tasks must be reclaimed by the
     # kanban dispatcher instead of making the project watchdog think progress is
     # still happening.
-    should_maintain_dispatcher = should_dispatch or bool(active)
+    should_maintain_dispatcher = control_allows_dispatch and (should_dispatch or bool(active))
     dispatch_result = _dispatch_once(opts.board) if opts.dispatch and should_maintain_dispatcher else None
     tick_id = f"fesun-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
     heartbeat = {
@@ -2051,7 +2191,9 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
         "runbook": str(runbook),
         "target": target,
         "eligible_count": len(eligible),
-        "runnable_count": len(eligible) - len(parked_external_blockers),
+        "runnable_count": (
+            len(eligible) - len(parked_external_blockers) if control_allows_dispatch else 0
+        ),
         "supervised_ready_modules": supervised_ready,
         "parked_external_blockers": parked_external_blockers,
         "active_tasks": active,
@@ -2062,7 +2204,14 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
         "no_progress_count": no_progress_count,
         "no_progress_threshold": int(opts.no_progress_threshold),
         "max_stage_attempts": int(opts.max_stage_attempts),
-        "guards": {"diff": diff_guard, "symlink": symlink_guard, "mapping": mapping, "diagnosis": diagnosis, "external": external_blocker},
+        "guards": {
+            "diff": diff_guard,
+            "symlink": symlink_guard,
+            "mapping": mapping,
+            "diagnosis": diagnosis,
+            "external": external_blocker,
+            "control": control,
+        },
         "dispatch": dispatch_result,
         "token_policy": "local scan only; LLM tokens only when created_tasks is non-empty",
     }
