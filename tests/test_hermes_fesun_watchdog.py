@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import subprocess
+import sys
 
 
 def _modules(tmp_path, monkeypatch):
@@ -1282,6 +1283,9 @@ def test_fesun_install_records_existing_out_of_scope_baseline(tmp_path, monkeypa
     script = (tmp_path / "home" / "scripts" / "fesun_nine_spec_watchdog.py").read_text(encoding="utf-8")
     assert '"create_tasks": false' in script
     assert '"dispatch": false' in script
+    assert f'"python_executable": "{sys.executable}"' in script
+    assert "if sys.version_info < (3, 10):" in script
+    assert "os.execv(python_executable, [python_executable, __file__, *sys.argv[1:]])" in script
     assert "os.environ['HERMES_FESUN_HEADLESS'] = '1'" in script
 
 

@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 from typing import Any
 from uuid import uuid4
@@ -2247,6 +2248,11 @@ def _script_content(payload: dict[str, Any]) -> str:
         "import os\n"
         "import sys\n\n"
         f"PAYLOAD = json.loads({serialized_payload!r})\n"
+        "if sys.version_info < (3, 10):\n"
+        "    python_executable = PAYLOAD.get('python_executable') or ''\n"
+        "    if not python_executable or not os.path.isfile(python_executable):\n"
+        "        raise RuntimeError('Hermes Watchdog requires Python 3.10+ and no compatible interpreter was recorded')\n"
+        "    os.execv(python_executable, [python_executable, __file__, *sys.argv[1:]])\n"
         "os.environ['HERMES_FESUN_HEADLESS'] = '1'\n"
         "repo = PAYLOAD.get('hermes_repo') or ''\n"
         "if repo and repo not in sys.path:\n"
@@ -2306,6 +2312,7 @@ def install(
     script_path = scripts / FESUN_SCRIPT_NAME
     payload = {
         "hermes_repo": str(Path(__file__).resolve().parent),
+        "python_executable": sys.executable,
         "repo": repo_path,
         "runbook": runbook_path,
         "board": board,
