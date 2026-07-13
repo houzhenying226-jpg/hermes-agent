@@ -81,6 +81,22 @@ def test_fesun_tick_dispatches_on_first_no_progress_tick_by_default(tmp_path, mo
     assert "当前目标：⑥销售B2B / spec" in text
 
 
+def test_gateway_status_write_skips_desktop_mirror(tmp_path, monkeypatch):
+    hermes_fesun_watchdog, _ = _modules(tmp_path, monkeypatch)
+    desktop_status = tmp_path / "Desktop" / "status.md"
+    monkeypatch.setattr(
+        hermes_fesun_watchdog,
+        "desktop_visible_status_path",
+        lambda: desktop_status,
+    )
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+
+    hermes_fesun_watchdog._write_visible_status({"mode": "watching"})
+
+    assert hermes_fesun_watchdog.visible_status_path().exists()
+    assert not desktop_status.exists()
+
+
 def test_fesun_parse_rescues_misplaced_status_rows_from_section_c(tmp_path, monkeypatch):
     hermes_fesun_watchdog, _ = _modules(tmp_path, monkeypatch)
     repo, runbook = _repo(tmp_path)
