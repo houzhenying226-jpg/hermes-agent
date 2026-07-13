@@ -1811,7 +1811,11 @@ def _render_visible_status(heartbeat: dict[str, Any]) -> str:
 def _write_visible_status(heartbeat: dict[str, Any]) -> None:
     text = _render_visible_status(heartbeat)
     _write_text_best_effort(visible_status_path(), text)
-    _write_text_best_effort(desktop_visible_status_path(), text)
+    # launchd/headless gateway children can block indefinitely in macOS TCC
+    # while opening ~/Desktop. The delivery copy is the runtime authority;
+    # keep the Desktop mirror for interactive invocations only.
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        _write_text_best_effort(desktop_visible_status_path(), text)
 
 
 def _worker_body(repo: Path, runbook: Path, target: dict[str, Any], guards: dict[str, Any]) -> str:
