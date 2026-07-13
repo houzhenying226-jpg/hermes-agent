@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 
 
@@ -1097,11 +1098,21 @@ def test_fesun_install_records_existing_out_of_scope_baseline(tmp_path, monkeypa
         runbook=str(runbook),
         board="default",
         assignee="default",
+        create_tasks=False,
+        dispatch=False,
     )
 
     assert data["ok"] is True
     assert ".github/copilot-instructions.md" in data["state"]["baseline_out_of_scope"]
     assert (tmp_path / "home" / "scripts" / "fesun_nine_spec_watchdog.py").exists()
+    jobs_file = tmp_path / "home" / "cron" / "jobs.json"
+    assert jobs_file.exists()
+    jobs = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+    assert [job["id"] for job in jobs] == [data["job"]["id"]]
+    assert jobs[0]["workdir"] == str(repo.resolve())
+    script = (tmp_path / "home" / "scripts" / "fesun_nine_spec_watchdog.py").read_text(encoding="utf-8")
+    assert '"create_tasks": false' in script
+    assert '"dispatch": false' in script
 
 
 def test_fesun_closure_stall_commits_docs_and_completes_running_task(tmp_path, monkeypatch):
