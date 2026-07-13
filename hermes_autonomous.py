@@ -531,27 +531,39 @@ def _scripts_dir() -> Path:
     return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser() / "scripts"
 
 
-def _watchdog_script_content(*, repo: str, workspace_path: str, board: str, assignee: str | None, goal_max_turns: int) -> str:
+def _watchdog_script_content(
+    *,
+    repo: str,
+    workspace_path: str,
+    board: str,
+    assignee: str | None,
+    goal_max_turns: int,
+    create_tasks: bool = True,
+    dispatch: bool = True,
+) -> str:
     payload = {
         "repo": repo,
         "workspace_path": workspace_path,
         "board": board,
         "assignee": assignee,
         "goal_max_turns": goal_max_turns,
+        "create_tasks": bool(create_tasks),
+        "dispatch": bool(dispatch),
     }
+    serialized_payload = json.dumps(payload, ensure_ascii=False, indent=2)
     return (
         "from __future__ import annotations\n"
         "import json\n"
         "import sys\n"
         "from pathlib import Path\n\n"
-        f"PAYLOAD = {json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        f"PAYLOAD = json.loads({serialized_payload!r})\n\n"
         "repo = PAYLOAD.get('repo') or ''\n"
         "if repo and repo not in sys.path:\n"
         "    sys.path.insert(0, repo)\n\n"
         "from hermes_autonomous import TickOptions, autonomous_tick\n\n"
         "result = autonomous_tick(TickOptions(\n"
-        "    create_tasks=True,\n"
-        "    dispatch=True,\n"
+        "    create_tasks=bool(PAYLOAD.get('create_tasks', True)),\n"
+        "    dispatch=bool(PAYLOAD.get('dispatch', True)),\n"
         "    board=PAYLOAD.get('board') or 'default',\n"
         "    assignee=PAYLOAD.get('assignee') or None,\n"
         "    goal_max_turns=int(PAYLOAD.get('goal_max_turns') or 120),\n"
@@ -564,8 +576,9 @@ def _watchdog_script_content(*, repo: str, workspace_path: str, board: str, assi
         "dispatch = tick.get('dispatch') or {}\n"
         "spawned_raw = dispatch.get('spawned') if isinstance(dispatch, dict) else 0\n"
         "spawned = len(spawned_raw) if isinstance(spawned_raw, list) else int(spawned_raw or 0)\n"
-        "if not bool(heartbeat.get('wake_agent')) and not created and spawned <= 0:\n"
-        "    print(json.dumps({'wakeAgent': False}))\n"
+        "monitor_only = not bool(PAYLOAD.get('create_tasks', True)) and not bool(PAYLOAD.get('dispatch', True))\n"
+        "if monitor_only or (not bool(heartbeat.get('wake_agent')) and not created and spawned <= 0):\n"
+        "    print(json.dumps({'wakeAgent': False, 'monitorOnly': monitor_only, 'heartbeatMode': heartbeat.get('mode')}))\n"
         "else:\n"
         "    print(json.dumps({\n"
         "        'wakeAgent': True,\n"
@@ -587,6 +600,8 @@ def install_watchdog(
     board: str = DEFAULT_BOARD,
     assignee: str | None = None,
     goal_max_turns: int = DEFAULT_GOAL_TURNS,
+    create_tasks: bool = True,
+    dispatch: bool = True,
 ) -> dict[str, Any]:
     """Install or replace the no-agent cron watchdog for autonomous ticks."""
 
@@ -602,6 +617,8 @@ def install_watchdog(
             board=board,
             assignee=assignee,
             goal_max_turns=max(1, int(goal_max_turns or DEFAULT_GOAL_TURNS)),
+            create_tasks=create_tasks,
+            dispatch=dispatch,
         ),
         encoding="utf-8",
     )
@@ -609,20 +626,21 @@ def install_watchdog(
     from cron import jobs as cron_jobs
 
     removed: list[str] = []
-    for job in cron_jobs.list_jobs(include_disabled=True):
-        if job.get("name") == WATCHDOG_JOB_NAME:
-            if cron_jobs.remove_job(str(job["id"])):
-                removed.append(str(job["id"]))
+    with cron_jobs.use_cron_store(scripts.parent):
+        for existing_job in cron_jobs.list_jobs(include_disabled=True):
+            if existing_job.get("name") == WATCHDOG_JOB_NAME:
+                if cron_jobs.remove_job(str(existing_job["id"])):
+                    removed.append(str(existing_job["id"]))
 
-    job = cron_jobs.create_job(
-        prompt="Hermes autonomous watchdog",
-        schedule=schedule,
-        name=WATCHDOG_JOB_NAME,
-        deliver="local",
-        script=WATCHDOG_SCRIPT_NAME,
-        workdir=repo_path,
-        no_agent=True,
-    )
+        job = cron_jobs.create_job(
+            prompt="Hermes autonomous watchdog",
+            schedule=schedule,
+            name=WATCHDOG_JOB_NAME,
+            deliver="local",
+            script=WATCHDOG_SCRIPT_NAME,
+            workdir=repo_path,
+            no_agent=True,
+        )
     state = load_runner_state()
     state["watchdog"] = {
         "installed": True,
@@ -635,6 +653,8 @@ def install_watchdog(
         "board": board,
         "assignee": assignee or "",
         "goal_max_turns": max(1, int(goal_max_turns or DEFAULT_GOAL_TURNS)),
+        "create_tasks": bool(create_tasks),
+        "dispatch": bool(dispatch),
         "installed_at": _utcnow(),
         "replaced_job_ids": removed,
     }
@@ -645,11 +665,12 @@ def install_watchdog(
 def watchdog_status() -> dict[str, Any]:
     from cron import jobs as cron_jobs
 
-    jobs = [
-        job
-        for job in cron_jobs.list_jobs(include_disabled=True)
-        if job.get("name") == WATCHDOG_JOB_NAME
-    ]
+    with cron_jobs.use_cron_store(_scripts_dir().parent):
+        jobs = [
+            job
+            for job in cron_jobs.list_jobs(include_disabled=True)
+            if job.get("name") == WATCHDOG_JOB_NAME
+        ]
     return {
         "ok": True,
         "installed": bool(jobs),

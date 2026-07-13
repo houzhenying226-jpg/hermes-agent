@@ -231,6 +231,8 @@ def test_install_watchdog_creates_single_no_agent_cron_job(tmp_path, monkeypatch
         workspace_path=str(tmp_path),
         assignee="default",
         goal_max_turns=21,
+        create_tasks=False,
+        dispatch=False,
     )
     status = hermes_autonomous.watchdog_status()
 
@@ -240,8 +242,15 @@ def test_install_watchdog_creates_single_no_agent_cron_job(tmp_path, monkeypatch
     assert status["installed"] is True
     assert len(status["jobs"]) == 1
     assert status["jobs"][0]["schedule_display"] == "every 3m"
+    assert status["jobs"][0]["workdir"] == str(tmp_path.resolve())
+    jobs_file = tmp_path / "home" / "cron" / "jobs.json"
+    assert jobs_file.exists()
+    jobs = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"]
+    assert [job["id"] for job in jobs] == [second["job"]["id"]]
     script = (tmp_path / "home" / "scripts" / "autonomous_watchdog.py").read_text(encoding="utf-8")
     assert "len(spawned_raw) if isinstance(spawned_raw, list)" in script
+    assert '"create_tasks": false' in script
+    assert '"dispatch": false' in script
 
 
 def test_generated_watchdog_imports_runtime_from_repo(tmp_path, monkeypatch):
@@ -270,4 +279,43 @@ def test_generated_watchdog_imports_runtime_from_repo(tmp_path, monkeypatch):
     result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, check=False)
 
     assert result.returncode == 0
-    assert json.loads(result.stdout) == {"wakeAgent": False}
+    assert json.loads(result.stdout) == {
+        "wakeAgent": False,
+        "monitorOnly": False,
+        "heartbeatMode": None,
+    }
+
+
+def test_generated_monitor_only_watchdog_never_wakes_agent(tmp_path, monkeypatch):
+    _, hermes_autonomous, _ = _modules(tmp_path, monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "hermes_autonomous.py").write_text(
+        "class TickOptions:\n"
+        "    def __init__(self, **kwargs): pass\n"
+        "def autonomous_tick(options):\n"
+        "    return {'tick': {'created_tasks': [], 'heartbeat': {'wake_agent': True, 'mode': 'blocked'}, 'dispatch': {}}}\n",
+        encoding="utf-8",
+    )
+    script = tmp_path / "watchdog.py"
+    script.write_text(
+        hermes_autonomous._watchdog_script_content(
+            repo=str(repo),
+            workspace_path=str(repo),
+            board="default",
+            assignee="default",
+            goal_max_turns=10,
+            create_tasks=False,
+            dispatch=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "wakeAgent": False,
+        "monitorOnly": True,
+        "heartbeatMode": "blocked",
+    }

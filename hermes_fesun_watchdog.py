@@ -2084,11 +2084,12 @@ def status() -> dict[str, Any]:
 
 
 def _script_content(payload: dict[str, Any]) -> str:
+    serialized_payload = json.dumps(payload, ensure_ascii=False, indent=2)
     return (
         "from __future__ import annotations\n"
         "import json\n"
         "import sys\n\n"
-        f"PAYLOAD = {json.dumps(payload, ensure_ascii=False, indent=2)}\n"
+        f"PAYLOAD = json.loads({serialized_payload!r})\n"
         "repo = PAYLOAD.get('hermes_repo') or ''\n"
         "if repo and repo not in sys.path:\n"
         "    sys.path.insert(0, repo)\n"
@@ -2099,8 +2100,8 @@ def _script_content(payload: dict[str, Any]) -> str:
         "    board=PAYLOAD.get('board') or 'default',\n"
         "    assignee=PAYLOAD.get('assignee') or None,\n"
         "    goal_max_turns=int(PAYLOAD.get('goal_max_turns') or 120),\n"
-        "    create_tasks=True,\n"
-        "    dispatch=True,\n"
+        "    create_tasks=bool(PAYLOAD.get('create_tasks', True)),\n"
+        "    dispatch=bool(PAYLOAD.get('dispatch', True)),\n"
         "    no_progress_threshold=int(PAYLOAD.get('no_progress_threshold') or 1),\n"
         "    max_stage_attempts=int(PAYLOAD.get('max_stage_attempts') or 3),\n"
         "    closure_stall_seconds=int(PAYLOAD.get('closure_stall_seconds') or 600),\n"
@@ -2126,6 +2127,8 @@ def install(
     no_progress_threshold: int = NO_PROGRESS_THRESHOLD,
     max_stage_attempts: int = MAX_STAGE_ATTEMPTS,
     closure_stall_seconds: int = CLOSURE_STALL_SECONDS,
+    create_tasks: bool = True,
+    dispatch: bool = True,
 ) -> dict[str, Any]:
     repo_path = str(Path(repo).expanduser().resolve())
     runbook_path = str(Path(runbook).expanduser().resolve())
@@ -2153,30 +2156,35 @@ def install(
         "no_progress_threshold": int(no_progress_threshold),
         "max_stage_attempts": int(max_stage_attempts),
         "closure_stall_seconds": int(closure_stall_seconds),
+        "create_tasks": bool(create_tasks),
+        "dispatch": bool(dispatch),
     }
     script_path.write_text(_script_content(payload), encoding="utf-8")
 
     from cron import jobs as cron_jobs
 
     removed: list[str] = []
-    for job in cron_jobs.list_jobs(include_disabled=True):
-        if job.get("name") == FESUN_JOB_NAME:
-            if cron_jobs.remove_job(str(job["id"])):
-                removed.append(str(job["id"]))
-    job = cron_jobs.create_job(
-        prompt="Fesun nine-module SPEC watchdog",
-        schedule=schedule,
-        name=FESUN_JOB_NAME,
-        deliver="local",
-        script=FESUN_SCRIPT_NAME,
-        workdir=repo_path,
-        no_agent=True,
-    )
+    with cron_jobs.use_cron_store(_home()):
+        for existing_job in cron_jobs.list_jobs(include_disabled=True):
+            if existing_job.get("name") == FESUN_JOB_NAME:
+                if cron_jobs.remove_job(str(existing_job["id"])):
+                    removed.append(str(existing_job["id"]))
+        job = cron_jobs.create_job(
+            prompt="Fesun nine-module SPEC watchdog",
+            schedule=schedule,
+            name=FESUN_JOB_NAME,
+            deliver="local",
+            script=FESUN_SCRIPT_NAME,
+            workdir=repo_path,
+            no_agent=True,
+        )
     state["watchdog"] = {
         "installed": True,
         "job_id": job["id"],
         "schedule": schedule,
         "script": str(script_path),
+        "create_tasks": bool(create_tasks),
+        "dispatch": bool(dispatch),
         "installed_at": _utcnow(),
         "removed_job_ids": removed,
     }
@@ -2187,9 +2195,10 @@ def install(
 def watchdog_status() -> dict[str, Any]:
     from cron import jobs as cron_jobs
 
-    jobs = [
-        job
-        for job in cron_jobs.list_jobs(include_disabled=True)
-        if job.get("name") == FESUN_JOB_NAME
-    ]
+    with cron_jobs.use_cron_store(_home()):
+        jobs = [
+            job
+            for job in cron_jobs.list_jobs(include_disabled=True)
+            if job.get("name") == FESUN_JOB_NAME
+        ]
     return {"ok": True, "installed": bool(jobs), "jobs": jobs, "script": str(_scripts_dir() / FESUN_SCRIPT_NAME), "state": load_state()}
