@@ -154,13 +154,31 @@ def _utcnow() -> str:
 
 
 def _kgctl_control_status(repo: Path) -> dict[str, Any]:
-    """Read the FESUN dispatch gate from the authoritative control plane."""
+    """Read FESUN coordination state without making KG the delivery gate.
+
+    FESUN is an ordinary delivery system.  A missing, stale, or negative KG
+    result is a coordinator degradation, not a reason to stop the GitHub
+    Issue/PR flow.  KG_GLOBAL keeps its separate hard enforcement path.
+    """
+    fallback = {
+        "coordination_mode": "soft",
+        "fallback_allowed": True,
+        "fallback_action": "DIRECT_GITHUB_FLOW",
+        "direct_path": [
+            "GitHub Issue or PR",
+            "isolated worktree and branch",
+            "tests and required checks",
+            "review and branch protection",
+            "merge queue or user-approved merge",
+        ],
+    }
     if repo != Path(DEFAULT_REPO).expanduser().resolve():
         return {
             "status": "not_applicable",
             "enforced": False,
             "dispatch_authorized": True,
             "control_blockers": [],
+            **fallback,
         }
 
     command = [KGCTL_BIN, "status", "FESUN"]
@@ -176,20 +194,22 @@ def _kgctl_control_status(repo: Path) -> dict[str, Any]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {
             "status": "unavailable",
-            "enforced": True,
+            "enforced": False,
             "dispatch_authorized": False,
             "control_blockers": [f"kgctl status FESUN unavailable: {exc}"],
             "command": command,
+            **fallback,
         }
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "unknown error").strip()
         return {
             "status": "unavailable",
-            "enforced": True,
+            "enforced": False,
             "dispatch_authorized": False,
             "control_blockers": [f"kgctl status FESUN failed ({result.returncode}): {detail}"],
             "command": command,
+            **fallback,
         }
 
     try:
@@ -197,27 +217,34 @@ def _kgctl_control_status(repo: Path) -> dict[str, Any]:
     except (TypeError, json.JSONDecodeError) as exc:
         return {
             "status": "unavailable",
-            "enforced": True,
+            "enforced": False,
             "dispatch_authorized": False,
             "control_blockers": [f"kgctl status FESUN returned invalid JSON: {exc}"],
             "command": command,
+            **fallback,
         }
     if not isinstance(payload, dict):
         return {
             "status": "unavailable",
-            "enforced": True,
+            "enforced": False,
             "dispatch_authorized": False,
             "control_blockers": ["kgctl status FESUN returned a non-object JSON payload"],
             "command": command,
+            **fallback,
         }
 
     authorized = payload.get("dispatch_authorized") is True
     blockers = [str(item) for item in payload.get("control_blockers") or []]
     if not authorized and not blockers:
         blockers = ["kgctl status FESUN did not authorize dispatch"]
+    soft = (
+        payload.get("coordination_mode") == "soft"
+        or payload.get("fallback_allowed") is True
+        or payload.get("fallback_action") == "DIRECT_GITHUB_FLOW"
+    )
     return {
-        "status": "authorized" if authorized else "blocked",
-        "enforced": True,
+        "status": "authorized" if authorized else ("soft_fallback" if soft else "blocked"),
+        "enforced": not soft,
         "dispatch_authorized": authorized,
         "control_blockers": blockers,
         "current_task": payload.get("current_task"),
@@ -227,6 +254,7 @@ def _kgctl_control_status(repo: Path) -> dict[str, Any]:
         "origin_main": payload.get("origin_main"),
         "next_legal_action": payload.get("next_legal_action"),
         "command": command,
+        **(fallback if soft else {}),
     }
 
 
@@ -2028,6 +2056,7 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
     target, parked_external_blockers, external_blocker = _select_dispatch_target(eligible)
     control = _apply_control_target_guard(_kgctl_control_status(repo), target)
     control_allows_dispatch = control.get("dispatch_authorized") is True
+    fallback_allowed = control.get("fallback_allowed") is True
     diff_guard = _diff_guard(repo, state.get("baseline_out_of_scope", []))
     symlink_guard = _symlink_guard(repo)
     diagnosis = _blocked_diagnosis(diff_guard, symlink_guard)
@@ -2051,6 +2080,7 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
         target, parked_external_blockers, external_blocker = _select_dispatch_target(eligible)
         control = _apply_control_target_guard(_kgctl_control_status(repo), target)
         control_allows_dispatch = control.get("dispatch_authorized") is True
+        fallback_allowed = control.get("fallback_allowed") is True
         diff_guard = _diff_guard(repo, state.get("baseline_out_of_scope", []))
         symlink_guard = _symlink_guard(repo)
         diagnosis = _blocked_diagnosis(diff_guard, symlink_guard)
@@ -2073,6 +2103,7 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
         target, parked_external_blockers, external_blocker = _select_dispatch_target(eligible)
         control = _apply_control_target_guard(_kgctl_control_status(repo), target)
         control_allows_dispatch = control.get("dispatch_authorized") is True
+        fallback_allowed = control.get("fallback_allowed") is True
         diff_guard = _diff_guard(repo, state.get("baseline_out_of_scope", []))
         symlink_guard = _symlink_guard(repo)
         diagnosis = _blocked_diagnosis(diff_guard, symlink_guard)
@@ -2100,6 +2131,12 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
     elif not symlink_guard["passed"]:
         mode = "guard_blocked"
         blocked_reason = str(diagnosis.get("summary") or "bad symlink under allowed docs roots")
+    elif fallback_allowed and not control_allows_dispatch:
+        mode = "direct_github_fallback"
+        blocked_reason = (
+            "KG coordinator unavailable or not authorizing; continue via "
+            "GitHub Issue/PR, isolated worktree, checks, review, and merge."
+        )
     elif not control_allows_dispatch:
         mode = "control_unavailable" if control.get("status") == "unavailable" else "control_blocked"
         blocked_reason = "; ".join(control.get("control_blockers") or ["kgctl dispatch gate blocked"])
@@ -2193,7 +2230,9 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
         "target": target,
         "eligible_count": len(eligible),
         "runnable_count": (
-            len(eligible) - len(parked_external_blockers) if control_allows_dispatch else 0
+            len(eligible) - len(parked_external_blockers)
+            if control_allows_dispatch or fallback_allowed
+            else 0
         ),
         "supervised_ready_modules": supervised_ready,
         "parked_external_blockers": parked_external_blockers,
@@ -2214,6 +2253,10 @@ def tick(options: FesunTickOptions | None = None) -> dict[str, Any]:
             "control": control,
         },
         "dispatch": dispatch_result,
+        "coordination_mode": "soft" if fallback_allowed else "hard",
+        "fallback_allowed": fallback_allowed,
+        "fallback_action": control.get("fallback_action") if fallback_allowed else None,
+        "direct_path": control.get("direct_path") if fallback_allowed else [],
         "token_policy": "local scan only; LLM tokens only when created_tasks is non-empty",
     }
     _atomic_write_json(heartbeat_path(), heartbeat)

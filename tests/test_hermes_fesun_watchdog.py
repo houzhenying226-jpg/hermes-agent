@@ -82,16 +82,19 @@ def test_fesun_tick_dispatches_on_first_no_progress_tick_by_default(tmp_path, mo
     assert "当前目标：⑥销售B2B / spec" in text
 
 
-def test_fesun_tick_blocks_dispatch_when_kgctl_does_not_authorize(tmp_path, monkeypatch):
+def test_fesun_tick_falls_back_when_kgctl_does_not_authorize(tmp_path, monkeypatch):
     hermes_fesun_watchdog, kanban_db = _modules(tmp_path, monkeypatch)
     repo, runbook = _repo(tmp_path)
     monkeypatch.setattr(
         hermes_fesun_watchdog,
         "_kgctl_control_status",
         lambda _repo: {
-            "status": "blocked",
-            "enforced": True,
+            "status": "soft_fallback",
+            "enforced": False,
             "dispatch_authorized": False,
+            "coordination_mode": "soft",
+            "fallback_allowed": True,
+            "fallback_action": "DIRECT_GITHUB_FLOW",
             "control_blockers": [
                 "flat queue requires KGCTL_MACHINE_TASK dispatch_authorized: true"
             ],
@@ -116,8 +119,8 @@ def test_fesun_tick_blocks_dispatch_when_kgctl_does_not_authorize(tmp_path, monk
     )
 
     heartbeat = result["heartbeat"]
-    assert heartbeat["mode"] == "control_blocked"
-    assert heartbeat["runnable_count"] == 0
+    assert heartbeat["mode"] == "direct_github_fallback"
+    assert heartbeat["runnable_count"] > 0
     assert heartbeat["created_tasks"] == []
     assert heartbeat["dispatch"] is None
     assert heartbeat["no_progress_count"] == 0
@@ -127,7 +130,7 @@ def test_fesun_tick_blocks_dispatch_when_kgctl_does_not_authorize(tmp_path, monk
     assert task_count == 0
 
 
-def test_fesun_tick_fails_closed_when_kgctl_is_unavailable(tmp_path, monkeypatch):
+def test_fesun_tick_falls_back_when_kgctl_is_unavailable(tmp_path, monkeypatch):
     hermes_fesun_watchdog, _ = _modules(tmp_path, monkeypatch)
     repo, runbook = _repo(tmp_path)
     monkeypatch.setattr(
@@ -135,8 +138,11 @@ def test_fesun_tick_fails_closed_when_kgctl_is_unavailable(tmp_path, monkeypatch
         "_kgctl_control_status",
         lambda _repo: {
             "status": "unavailable",
-            "enforced": True,
+            "enforced": False,
             "dispatch_authorized": False,
+            "coordination_mode": "soft",
+            "fallback_allowed": True,
+            "fallback_action": "DIRECT_GITHUB_FLOW",
             "control_blockers": ["kgctl status FESUN unavailable: timeout"],
         },
     )
@@ -152,8 +158,8 @@ def test_fesun_tick_fails_closed_when_kgctl_is_unavailable(tmp_path, monkeypatch
     )
 
     heartbeat = result["heartbeat"]
-    assert heartbeat["mode"] == "control_unavailable"
-    assert heartbeat["runnable_count"] == 0
+    assert heartbeat["mode"] == "direct_github_fallback"
+    assert heartbeat["runnable_count"] > 0
     assert heartbeat["created_tasks"] == []
     assert heartbeat["dispatch"] is None
 
