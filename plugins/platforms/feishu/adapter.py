@@ -205,6 +205,12 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
+_FEISHU_FIELD_VALIDATION_FAILED = 99992402
+_FEISHU_TRANSIENT_RESPONSE_CODES = frozenset({429, 500, 502, 503, 504})
+_FEISHU_TRANSIENT_RESPONSE_RE = re.compile(
+    r"(?:rate.?limit|too many requests|timeout|temporar|service unavailable|system busy|internal error)",
+    re.IGNORECASE,
+)
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
@@ -4662,54 +4668,65 @@ class FeishuAdapter(BasePlatformAdapter):
         payload: str,
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
+        uuid_value: Optional[str] = None,
     ) -> Any:
         effective_reply_to = reply_to
-        if not effective_reply_to and metadata and metadata.get("thread_id"):
-            effective_reply_to = metadata.get("reply_to_message_id")
+        delivery_uuid = uuid_value or str(uuid.uuid4())
         reply_in_thread = bool((metadata or {}).get("thread_id"))
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=delivery_uuid,
             )
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
 
-        # For topic/thread messages that fell back from reply→create, use
-        # thread_id as receive_id so the message lands in the topic instead of
-        # the main chat.
-        _thread_id = (metadata or {}).get("thread_id")
-        if _thread_id:
-            body = self._build_create_message_body(
-                receive_id=_thread_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request("thread_id", body)
-        else:
-            receive_id = chat_id
-            receive_id_type = "chat_id"
-            if chat_id.startswith("feishu_user_id:"):
-                receive_id = chat_id.split(":", 1)[1]
-                receive_id_type = "user_id"
-            elif chat_id.startswith("ou_"):
-                receive_id_type = "open_id"
+        # A thread/topic id is not a valid receive_id for message.create in
+        # this delivery path. Without a real message anchor, use the concrete
+        # chat/user destination so synthetic background events cannot trigger
+        # Feishu field-validation error 99992402.
+        receive_id = chat_id
+        receive_id_type = "chat_id"
+        if chat_id.startswith("feishu_user_id:"):
+            receive_id = chat_id.split(":", 1)[1]
+            receive_id_type = "user_id"
+        elif chat_id.startswith("ou_"):
+            receive_id_type = "open_id"
 
-            body = self._build_create_message_body(
-                receive_id=receive_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request(receive_id_type, body)
+        body = self._build_create_message_body(
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=payload,
+            uuid_value=delivery_uuid,
+        )
+        request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
         return bool(response and getattr(response, "success", lambda: False)())
+
+    @staticmethod
+    def _response_is_transient(response: Any) -> bool:
+        if not response or FeishuAdapter._response_succeeded(response):
+            return False
+        code = getattr(response, "code", None)
+        try:
+            normalized_code = int(code)
+        except (TypeError, ValueError):
+            normalized_code = None
+        if normalized_code in _FEISHU_TRANSIENT_RESPONSE_CODES:
+            return True
+        status_code = getattr(response, "status_code", None)
+        try:
+            normalized_status = int(status_code)
+        except (TypeError, ValueError):
+            normalized_status = None
+        if normalized_status == 429 or (normalized_status is not None and normalized_status >= 500):
+            return True
+        return bool(_FEISHU_TRANSIENT_RESPONSE_RE.search(str(getattr(response, "msg", "") or "")))
 
     @staticmethod
     def _extract_response_field(response: Any, field_name: str) -> Any:
@@ -4840,7 +4857,9 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         last_error: Optional[Exception] = None
-        active_reply_to = reply_to
+        active_reply_to = reply_to or (metadata or {}).get("reply_to_message_id")
+        delivery_uuid = str(uuid.uuid4())
+        field_route_fallback_used = False
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
             try:
                 response = await self._send_raw_message(
@@ -4849,7 +4868,32 @@ class FeishuAdapter(BasePlatformAdapter):
                     payload=payload,
                     reply_to=active_reply_to,
                     metadata=metadata,
+                    uuid_value=delivery_uuid,
                 )
+                code = getattr(response, "code", None)
+                if (
+                    active_reply_to
+                    and not self._response_succeeded(response)
+                    and code == _FEISHU_FIELD_VALIDATION_FAILED
+                    and not field_route_fallback_used
+                ):
+                    logger.warning(
+                        "[Feishu] Reply route validation failed for %s (code %s); "
+                        "falling back once to chat %s",
+                        active_reply_to,
+                        code,
+                        chat_id,
+                    )
+                    active_reply_to = None
+                    field_route_fallback_used = True
+                    response = await self._send_raw_message(
+                        chat_id=chat_id,
+                        msg_type=msg_type,
+                        payload=payload,
+                        reply_to=None,
+                        metadata=metadata,
+                        uuid_value=delivery_uuid,
+                    )
                 # If replying to a message failed because it was withdrawn or not found,
                 # fall back to posting a new message directly to the chat.
                 if active_reply_to and not self._response_succeeded(response):
@@ -4878,7 +4922,23 @@ class FeishuAdapter(BasePlatformAdapter):
                             payload=payload,
                             reply_to=None,
                             metadata=metadata,
+                            uuid_value=delivery_uuid,
                         )
+                if self._response_succeeded(response):
+                    return response
+                if self._response_is_transient(response) and attempt < _FEISHU_SEND_ATTEMPTS - 1:
+                    wait_seconds = 2 ** attempt
+                    logger.warning(
+                        "[Feishu] Send attempt %d/%d returned transient code %s for chat %s; "
+                        "retrying in %ds",
+                        attempt + 1,
+                        _FEISHU_SEND_ATTEMPTS,
+                        getattr(response, "code", None),
+                        chat_id,
+                        wait_seconds,
+                    )
+                    await asyncio.sleep(wait_seconds)
+                    continue
                 return response
             except Exception as exc:
                 last_error = exc

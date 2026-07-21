@@ -16,6 +16,14 @@ from gateway.stream_consumer import (
 )
 
 
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
 def _make_adapter(send_result=None, edit_result=None, max_length=4096):
     adapter = MagicMock()
     adapter.send = AsyncMock(
@@ -182,12 +190,11 @@ class TestOverflowFirstMessage:
 
 
 class TestFeishuFallbackThreadRouting:
-    """Verify FeishuAdapter._send_raw_message routes to topic on fallback."""
+    """Verify no-anchor sends avoid invalid synthetic thread routing."""
 
     @pytest.mark.asyncio
-    async def test_create_uses_thread_id_when_available(self):
-        """When reply_to=None and metadata has thread_id, message.create
-        should use receive_id_type='thread_id'."""
+    async def test_create_uses_chat_id_when_thread_has_no_reply_anchor(self):
+        """A synthetic thread id is not a valid message.create destination."""
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         # We test the _send_raw_message method directly by mocking the client
@@ -226,25 +233,25 @@ class TestFeishuFallbackThreadRouting:
         # Verify message.create was called (not message.reply)
         mock_client.im.v1.message.create.assert_called_once()
 
-        # The request should have receive_id_type="thread_id"
+        # Without a real reply anchor, fall back to a top-level chat message.
         call_args = mock_client.im.v1.message.create.call_args[0][0]
         # Lark SDK builder exposes .body; the in-tree fallback exposes .request_body.
         # The contributor's branch had the lark SDK installed, the test environment
         # may not — handle both shapes.
         body = getattr(call_args, "body", None) or getattr(call_args, "request_body", None)
         assert body is not None, "request has neither .body nor .request_body"
-        # receive_id should be the thread_id, not the chat_id
+        # receive_id must be the real chat_id, not the synthetic thread_id.
         receive_id = getattr(body, "receive_id", None)
         if receive_id is None and isinstance(body, str):
             import json as _json
             receive_id = _json.loads(body).get("receive_id")
-        assert receive_id == "omt_topic_abc", (
-            f"Expected receive_id='omt_topic_abc', got '{receive_id}'"
+        assert receive_id == "oc_main_chat", (
+            f"Expected receive_id='oc_main_chat', got '{receive_id}'"
         )
-        # And receive_id_type must be 'thread_id', not 'chat_id'
+        # Feishu accepts chat_id here; thread_id causes API error 99992402.
         receive_id_type = getattr(call_args, "receive_id_type", None)
-        assert receive_id_type == "thread_id", (
-            f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
+        assert receive_id_type == "chat_id", (
+            f"Expected receive_id_type='chat_id', got '{receive_id_type}'"
         )
 
     @pytest.mark.asyncio

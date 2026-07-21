@@ -2273,6 +2273,149 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(sleeps, [])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_falls_back_once_on_field_validation_failure(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"reply": [], "create": []}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["reply"].append(request)
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=99992402,
+                    msg="field validation failed",
+                )
+
+            def create(self, request):
+                captured["create"].append(request)
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_fallback"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="background update",
+                    metadata={
+                        "thread_id": "omt-synthetic",
+                        "reply_to_message_id": "om_anchor",
+                    },
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_fallback")
+        self.assertEqual(len(captured["reply"]), 1)
+        self.assertEqual(len(captured["create"]), 1)
+        self.assertEqual(captured["create"][0].receive_id_type, "chat_id")
+        self.assertEqual(captured["create"][0].request_body.receive_id, "oc_chat")
+        self.assertEqual(
+            captured["reply"][0].request_body.uuid,
+            captured["create"][0].request_body.uuid,
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_retries_transient_api_response_with_stable_uuid(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = []
+        sleeps = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured.append(request)
+                if len(captured) == 1:
+                    return SimpleNamespace(
+                        success=lambda: False,
+                        code=503,
+                        msg="service unavailable",
+                    )
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_retry_response"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        async def _sleep(delay):
+            sleeps.append(delay)
+
+        with (
+            patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct),
+            patch("plugins.platforms.feishu.adapter.asyncio.sleep", side_effect=_sleep),
+        ):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="retry response"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(
+            captured[0].request_body.uuid,
+            captured[1].request_body.uuid,
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_bounds_transient_api_response_retries(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = []
+        sleeps = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured.append(request)
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=503,
+                    msg="service unavailable",
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        async def _sleep(delay):
+            sleeps.append(delay)
+
+        with (
+            patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct),
+            patch("plugins.platforms.feishu.adapter.asyncio.sleep", side_effect=_sleep),
+        ):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="still unavailable"))
+
+        self.assertFalse(result.success)
+        self.assertEqual(len(captured), 3)
+        self.assertEqual(sleeps, [1, 2])
+        self.assertEqual(
+            {request.request_body.uuid for request in captured},
+            {captured[0].request_body.uuid},
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_document_reply_uses_thread_flag(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
