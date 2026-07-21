@@ -606,6 +606,27 @@ class TestActiveQueries:
         registry._running[s.id] = s
         assert registry.has_active_for_session("gw_session_1") is True
 
+    def test_kill_all_can_be_scoped_to_gateway_session(self, registry, monkeypatch):
+        """A session-level stop must not kill a sibling gateway session."""
+        own = _make_session(sid="proc_own")
+        own.session_key = "gw_session_1"
+        sibling = _make_session(sid="proc_sibling")
+        sibling.session_key = "gw_session_2"
+        registry._running[own.id] = own
+        registry._running[sibling.id] = sibling
+        killed = []
+
+        monkeypatch.setattr(
+            registry,
+            "kill_process",
+            lambda session_id, **_kwargs: (
+                killed.append(session_id), {"status": "killed"}
+            )[1],
+        )
+
+        assert registry.kill_all(session_key="gw_session_1") == 1
+        assert killed == ["proc_own"]
+
     def test_exited_not_active(self, registry):
         s = _make_session(task_id="t1", exited=True, exit_code=0)
         registry._finished[s.id] = s
