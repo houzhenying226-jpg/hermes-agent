@@ -2285,7 +2285,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 captured["reply"].append(request)
                 return SimpleNamespace(
                     success=lambda: False,
-                    code=99992402,
+                    code="99992402",
                     msg="field validation failed",
                 )
 

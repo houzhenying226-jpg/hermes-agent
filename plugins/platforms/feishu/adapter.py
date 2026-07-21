@@ -4874,7 +4874,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 if (
                     active_reply_to
                     and not self._response_succeeded(response)
-                    and code == _FEISHU_FIELD_VALIDATION_FAILED
+                    and str(code) == str(_FEISHU_FIELD_VALIDATION_FAILED)
                     and not field_route_fallback_used
                 ):
                     logger.warning(
