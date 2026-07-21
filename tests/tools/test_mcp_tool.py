@@ -122,6 +122,35 @@ class TestLoadMCPConfig:
             result = _load_mcp_config()
             assert result == {}
 
+    def test_json_string_stdio_args_are_normalized(self):
+        from tools.mcp_tool import _normalize_stdio_args
+
+        assert _normalize_stdio_args(
+            "notion",
+            '["-y", "@notionhq/notion-mcp-server"]',
+        ) == ["-y", "@notionhq/notion-mcp-server"]
+
+    def test_non_list_json_stdio_args_are_rejected(self):
+        from tools.mcp_tool import _normalize_stdio_args
+
+        with pytest.raises(ValueError, match="must be a list"):
+            _normalize_stdio_args("broken", '{"unexpected": true}')
+
+
+class TestMCPStderrRotation:
+    def test_rotates_oversized_log_before_open(self, tmp_path):
+        from tools.mcp_tool import _rotate_mcp_stderr_log
+
+        log_path = tmp_path / "mcp-stderr.log"
+        log_path.write_text("current-log", encoding="utf-8")
+        (tmp_path / "mcp-stderr.log.1").write_text("older-log", encoding="utf-8")
+
+        _rotate_mcp_stderr_log(log_path, max_bytes=4, backups=2)
+
+        assert not log_path.exists()
+        assert (tmp_path / "mcp-stderr.log.1").read_text(encoding="utf-8") == "current-log"
+        assert (tmp_path / "mcp-stderr.log.2").read_text(encoding="utf-8") == "older-log"
+
 
 class TestMCPStatus:
     def test_status_distinguishes_configured_connecting_failed_and_disabled(
