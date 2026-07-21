@@ -1430,6 +1430,54 @@ def test_fesun_closure_stall_requires_completion_log_signal(tmp_path, monkeypatc
     assert latest == "init"
 
 
+def test_fesun_closure_stall_waits_for_stale_heartbeat(tmp_path, monkeypatch):
+    hermes_fesun_watchdog, _ = _modules(tmp_path, monkeypatch)
+    monkeypatch.setattr(hermes_fesun_watchdog.time, "time", lambda: 1_000)
+    monkeypatch.setattr(
+        hermes_fesun_watchdog,
+        "_active_task_module_stage",
+        lambda task: ("sales", "spec"),
+    )
+    monkeypatch.setattr(hermes_fesun_watchdog, "_row_for_module", lambda *args: {})
+    monkeypatch.setattr(
+        hermes_fesun_watchdog,
+        "_task_log_tail",
+        lambda *args: "written the results to disk",
+    )
+    monkeypatch.setattr(
+        hermes_fesun_watchdog,
+        "_related_changed_paths",
+        lambda *args, **kwargs: ["docs/specs/sales/spec.md"],
+    )
+    commit_calls = []
+    monkeypatch.setattr(
+        hermes_fesun_watchdog,
+        "_commit_related_paths",
+        lambda *args: commit_calls.append(args) or {"ok": False, "status": "skipped"},
+    )
+
+    recoveries = hermes_fesun_watchdog._recover_closure_stalls(
+        repo=tmp_path,
+        runbook=tmp_path / "runbook.md",
+        runbook_data={},
+        board="default",
+        active=[
+            {
+                "id": "t_fresh",
+                "status": "running",
+                "created_at": 1,
+                "last_heartbeat_at": 950,
+            }
+        ],
+        diff_guard={"passed": True},
+        closure_stall_seconds=100,
+        enabled=True,
+    )
+
+    assert recoveries == []
+    assert commit_calls == []
+
+
 def test_fesun_closure_stall_closes_when_runbook_stage_advanced(tmp_path, monkeypatch):
     hermes_fesun_watchdog, kanban_db = _modules(tmp_path, monkeypatch)
     repo, runbook = _repo(tmp_path)

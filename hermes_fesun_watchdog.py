@@ -1432,8 +1432,12 @@ def _recover_closure_stalls(
     for task in active:
         if task.get("status") != "running":
             continue
-        created_at = int(task.get("created_at") or 0)
-        if closure_stall_seconds > 0 and created_at and now - created_at < closure_stall_seconds:
+        last_activity_at = int(task.get("last_heartbeat_at") or task.get("created_at") or 0)
+        if (
+            closure_stall_seconds > 0
+            and last_activity_at
+            and now - last_activity_at < closure_stall_seconds
+        ):
             continue
         task_id = str(task.get("id") or "")
         module_slug, stage = _active_task_module_stage(task)
