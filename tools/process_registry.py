@@ -1821,12 +1821,19 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited for s in self._running.values())
 
-    def kill_all(self, task_id: str = None) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+    def kill_all(self, task_id: str = None, session_key: str = None) -> int:
+        """Kill running processes, optionally scoped by task or gateway session.
+
+        A TUI gateway hosts multiple sessions in one process. Callers handling
+        a session-level stop must provide ``session_key`` so they cannot reap a
+        sibling session's background processes.
+        """
         with self._lock:
             targets = [
                 s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and not s.exited
+                if (task_id is None or s.task_id == task_id)
+                and (session_key is None or s.session_key == session_key)
+                and not s.exited
             ]
 
         killed = 0

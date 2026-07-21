@@ -102,6 +102,7 @@ import shutil
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -140,6 +141,30 @@ _OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
 
 _mcp_stderr_log_fh: Optional[Any] = None
 _mcp_stderr_log_lock = threading.Lock()
+_MCP_STDERR_MAX_BYTES = 5 * 1024 * 1024
+_MCP_STDERR_BACKUPS = 3
+
+
+def _rotate_mcp_stderr_log(
+    log_path: Path,
+    *,
+    max_bytes: int = _MCP_STDERR_MAX_BYTES,
+    backups: int = _MCP_STDERR_BACKUPS,
+) -> None:
+    """Rotate an oversized MCP stderr log before a subprocess opens it."""
+    path = Path(log_path)
+    if not path.exists() or path.stat().st_size <= max_bytes:
+        return
+    if backups <= 0:
+        path.unlink()
+        return
+    oldest = path.with_name(f"{path.name}.{backups}")
+    oldest.unlink(missing_ok=True)
+    for index in range(backups - 1, 0, -1):
+        source = path.with_name(f"{path.name}.{index}")
+        if source.exists():
+            source.replace(path.with_name(f"{path.name}.{index + 1}"))
+    path.replace(path.with_name(f"{path.name}.1"))
 
 
 def _get_mcp_stderr_log() -> Any:
@@ -159,6 +184,7 @@ def _get_mcp_stderr_log() -> Any:
             log_dir = get_hermes_home() / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / "mcp-stderr.log"
+            _rotate_mcp_stderr_log(log_path)
             # Line-buffered so server output lands on disk promptly; errors=
             # "replace" tolerates garbled binary output from misbehaving
             # servers.
@@ -191,6 +217,28 @@ def _write_stderr_log_header(server_name: str) -> None:
         fh.flush()
     except Exception:
         pass
+
+
+def _normalize_stdio_args(server_name: str, raw_args: Any) -> List[str]:
+    """Return stdio arguments as a list, accepting legacy JSON strings."""
+    if raw_args is None:
+        return []
+    parsed = raw_args
+    if isinstance(raw_args, str):
+        value = raw_args.strip()
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"MCP server '{server_name}' args must be a YAML/JSON list"
+            ) from exc
+    if not isinstance(parsed, (list, tuple)):
+        raise ValueError(f"MCP server '{server_name}' args must be a list")
+    if not all(isinstance(item, str) for item in parsed):
+        raise ValueError(f"MCP server '{server_name}' args entries must be strings")
+    return list(parsed)
 
 # ---------------------------------------------------------------------------
 # Graceful import -- MCP SDK is an optional dependency
@@ -2221,7 +2269,7 @@ class MCPServerTask:
             )
 
         command = config.get("command")
-        args = config.get("args", [])
+        args = _normalize_stdio_args(self.name, config.get("args", []))
         user_env = config.get("env")
 
         if not command:

@@ -81,6 +81,46 @@ def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
         reset_hermes_home_override(token)
 
 
+def test_process_stop_only_kills_processes_owned_by_request_session(monkeypatch):
+    """A desktop window must not stop background processes from another window."""
+    from tools.process_registry import process_registry
+
+    server._sessions["stop-owner"] = {"session_key": "gateway-owner"}
+    seen = {}
+
+    def _kill_all(*, session_key=None, **_kwargs):
+        seen["session_key"] = session_key
+        return 1
+
+    monkeypatch.setattr(process_registry, "kill_all", _kill_all)
+    try:
+        result = server._methods["process.stop"](
+            "request-1", {"session_id": "stop-owner"}
+        )
+        assert result["result"] == {"killed": 1}
+        assert seen == {"session_key": "gateway-owner"}
+    finally:
+        server._sessions.pop("stop-owner", None)
+
+
+def test_slash_stop_only_kills_processes_owned_by_live_session(monkeypatch):
+    """The slash-command mirror must use the same session boundary as RPC."""
+    from tools.process_registry import process_registry
+
+    seen = {}
+
+    def _kill_all(*, session_key=None, **_kwargs):
+        seen["session_key"] = session_key
+        return 1
+
+    monkeypatch.setattr(process_registry, "kill_all", _kill_all)
+    warning = server._mirror_slash_side_effects(
+        "slash-owner", {"session_key": "gateway-owner", "agent": None}, "/stop"
+    )
+    assert warning == ""
+    assert seen == {"session_key": "gateway-owner"}
+
+
 def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     """Desktop/TUI sessions must pin the agent cwd per session.
 

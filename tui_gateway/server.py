@@ -12734,10 +12734,17 @@ def _(rid, params: dict) -> dict:
 
 @method("process.stop")
 def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
     try:
         from tools.process_registry import process_registry
 
-        return _ok(rid, {"killed": process_registry.kill_all()})
+        session_key = str(session.get("session_key") or "")
+        return _ok(
+            rid,
+            {"killed": process_registry.kill_all(session_key=session_key)},
+        )
     except Exception as e:
         return _err(rid, 5010, str(e))
 
@@ -14735,7 +14742,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         elif name == "stop":
             from tools.process_registry import process_registry
 
-            process_registry.kill_all()
+            process_registry.kill_all(
+                session_key=str(session.get("session_key") or sid),
+            )
     except Exception as e:
         return f"live session sync failed: {e}"
     return ""

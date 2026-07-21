@@ -177,7 +177,20 @@ CI Failed
 ```bash
 git add <fixed_files> && git commit -m "fix: resolve CI failure" && git push
 
-# Then monitor
-gh pr checks --watch 2>/dev/null || \
-  echo "Poll with: curl -s -H 'Authorization: token ...' https://api.github.com/repos/.../commits/$(git rev-parse HEAD)/status"
+# Then run this as a managed background task with notify_on_complete=true.
+# It exits after five minutes so the agent must report status and can start
+# another bounded window if checks are still pending.
+PR=123
+deadline=$((SECONDS + 300))
+while (( SECONDS < deadline )); do
+  gh pr checks "$PR" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) echo "CI_REPORT all checks passed"; exit 0 ;;
+    8) echo "CI_REPORT checks still pending"; sleep 60 ;;
+    *) echo "CI_REPORT checks failed"; gh pr checks "$PR"; exit 1 ;;
+  esac
+done
+echo "CI_REPORT checks still pending after 5-minute window"
+exit 8
 ```

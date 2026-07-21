@@ -2026,6 +2026,17 @@ def _foreground_background_guidance(command: str) -> str | None:
     # false positives (e.g., git commit -m "... setsid ...", python3 -c "os.setsid").
     unquoted = _strip_quotes(command)
 
+    if (
+        re.search(r"\bgh\s+pr\s+checks\b", unquoted, re.IGNORECASE)
+        and re.search(r"(?:^|\s)--watch(?:=\S+)?(?:\s|$)", unquoted, re.IGNORECASE)
+    ):
+        return (
+            "Foreground gh pr checks --watch is not allowed because it can occupy the active "
+            "turn indefinitely. Use a bounded exit-code poller with background=true and "
+            "notify_on_complete=true, then report the resulting CI status before starting "
+            "another bounded polling window."
+        )
+
     if _SHELL_LEVEL_BACKGROUND_RE.search(unquoted):
         return (
             "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "

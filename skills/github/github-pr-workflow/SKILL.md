@@ -158,10 +158,31 @@ To create as a draft, add `"draft": true` to the JSON body.
 ```bash
 # One-shot check
 gh pr checks
-
-# Watch until all checks finish (polls every 10s)
-gh pr checks --watch
 ```
+
+Never run `gh pr checks --watch` in the foreground. Use a managed,
+five-minute background polling window with `background=true` and
+`notify_on_complete=true`:
+
+```bash
+PR=123
+deadline=$((SECONDS + 300))
+while (( SECONDS < deadline )); do
+  gh pr checks "$PR" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) echo "CI_REPORT all checks passed"; exit 0 ;;
+    8) echo "CI_REPORT checks still pending"; sleep 60 ;;
+    *) echo "CI_REPORT checks failed"; gh pr checks "$PR"; exit 1 ;;
+  esac
+done
+echo "CI_REPORT checks still pending after 5-minute window"
+exit 8
+```
+
+When that bounded process exits, report its final status before starting
+another window. This keeps the active conversation responsive and guarantees
+a status update at least every five minutes.
 
 **With git + curl:**
 
